@@ -28,10 +28,22 @@ python3 app.py --db ./data.db --port 8324
 - `GET /`：演示页面。
 - `GET /api/records`：记录列表，可带`state`和`limit`参数。
 - `GET /api/records/{id}`：记录详情。
-- `GET /api/records/{id}/audit`：审计时间线。
+- `GET /api/records/{id}/audit`：审计时间线，企业行动事件内含应用前后的数量/价格/金额对照。
 - `GET /api/stats`：状态统计。
+- `GET /api/cash-entitlements`：现金权益列表，可带`record_id`、`status`参数。
+- `GET /api/cash-entitlements/{id}`：现金权益详情（`reconcilable`仅在入账后为true）。
+- `POST /api/cash-entitlements/{id}/reconcile`：核对现金权益金额，请求体为`{"actual_amount":500.0}`，仅入账后可核对。
 - `POST /api/records`：创建记录，请求体为`{"reference":"...","data":{...}}`。
 - `POST /api/records/{id}/actions/{action}`：执行业务动作，请求体为`{"expected_version":1,"data":{...}}`。
+
+### 企业行动
+
+`corporate_action`支持`split`（拆股）、`merger`（合并换股）、`dividend`（现金分红），`action_ratio`为比例/每股金额：
+
+- 拆股：有效数量=原数量×比例，有效均价=原价÷比例。
+- 合并：`action_ratio`份旧股换1股新股，有效数量=原数量÷比例，有效均价=原价×比例，持仓金额保持不变。
+- 现金分红：数量与均价不变，应用时按有效股数生成一笔`pending`现金权益，经`post_entitlement`动作入账（`booked`）后金额才可核对。
+- 审计时间线记录应用前后的数量、价格、金额对照；交收（`settle`）一律按企业行动后的`effective_quantity`核对证券数量。
 
 除`/health`和`/`外，请求需提供`X-User-Id`、`X-Role`，可选`X-Org`。
 

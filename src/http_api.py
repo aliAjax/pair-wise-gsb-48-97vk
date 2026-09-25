@@ -12,6 +12,8 @@ from .domain import Actor, DomainError, PermissionDenied, ValidationError
 RECORD_RE = re.compile(r"^/api/records/(\d+)$")
 ACTION_RE = re.compile(r"^/api/records/(\d+)/actions/([a-z_]+)$")
 AUDIT_RE = re.compile(r"^/api/records/(\d+)/audit$")
+ENTITLEMENT_RE = re.compile(r"^/api/cash-entitlements/(\d+)$")
+RECONCILE_RE = re.compile(r"^/api/cash-entitlements/(\d+)/reconcile$")
 
 
 def make_handler(service: Any, static_dir: Path):
@@ -76,6 +78,21 @@ def make_handler(service: Any, static_dir: Path):
                     records = service.list_records(self._actor(), state=query.get("state", [None])[0], limit=int(query.get("limit", ["100"])[0]))
                     self._send(200, {"items": records})
                     return
+                if parsed.path == "/api/cash-entitlements":
+                    query = parse_qs(parsed.query)
+                    record_id = query.get("record_id", [None])[0]
+                    entitlements = service.list_entitlements(
+                        self._actor(),
+                        record_id=int(record_id) if record_id else None,
+                        status=query.get("status", [None])[0],
+                        limit=int(query.get("limit", ["100"])[0]),
+                    )
+                    self._send(200, {"items": entitlements})
+                    return
+                match = ENTITLEMENT_RE.match(parsed.path)
+                if match:
+                    self._send(200, service.get_entitlement(self._actor(), int(match.group(1))))
+                    return
                 match = RECORD_RE.match(parsed.path)
                 if match:
                     self._send(200, service.get_record(self._actor(), int(match.group(1))))
@@ -98,6 +115,14 @@ def make_handler(service: Any, static_dir: Path):
                 if parsed.path == "/api/records":
                     record = service.create(self._actor(), body.get("reference", ""), body.get("data", {}))
                     self._send(201, record)
+                    return
+                match = RECONCILE_RE.match(parsed.path)
+                if match:
+                    actual = body.get("actual_amount")
+                    if isinstance(actual, bool) or not isinstance(actual, (int, float)):
+                        raise ValidationError("actual_amount必须是数字")
+                    result = service.reconcile_entitlement(self._actor(), int(match.group(1)), float(actual))
+                    self._send(200, result)
                     return
                 match = ACTION_RE.match(parsed.path)
                 if match:
