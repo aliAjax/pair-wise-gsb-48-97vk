@@ -47,6 +47,22 @@ class Repository:
                     details TEXT NOT NULL,
                     created_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS cash_entitlements (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    record_id INTEGER NOT NULL UNIQUE REFERENCES records(id) ON DELETE CASCADE,
+                    instrument TEXT NOT NULL,
+                    currency TEXT NOT NULL,
+                    quantity INTEGER NOT NULL,
+                    per_share_amount REAL NOT NULL,
+                    expected_amount REAL NOT NULL,
+                    posted_amount REAL,
+                    status TEXT NOT NULL,
+                    version INTEGER NOT NULL DEFAULT 1,
+                    created_by TEXT NOT NULL,
+                    posted_by TEXT,
+                    created_at TEXT NOT NULL,
+                    posted_at TEXT
+                );
                 CREATE INDEX IF NOT EXISTS idx_records_state ON records(state);
                 CREATE INDEX IF NOT EXISTS idx_audit_record ON audit_events(record_id, id);
                 """
@@ -56,6 +72,16 @@ class Repository:
     def _row(row: sqlite3.Row) -> Dict[str, Any]:
         item = dict(row)
         item["payload"] = json.loads(item["payload"])
+        return item
+
+    @staticmethod
+    def _entitlement_row(row: sqlite3.Row) -> Dict[str, Any]:
+        item = dict(row)
+        for key in ("per_share_amount", "expected_amount", "posted_amount"):
+            value = item.get(key)
+            item[key] = round(float(value), 2) if value is not None else None
+        item["quantity"] = int(item["quantity"])
+        item["version"] = int(item["version"])
         return item
 
     def create(self, reference: str, state: str, payload: Dict[str, Any], actor_id: str) -> Dict[str, Any]:
@@ -92,7 +118,7 @@ class Repository:
                 rows = connection.execute("SELECT * FROM records ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
         return [self._row(row) for row in rows]
 
-    def mutate(self, record_id: int, expected_version: int, state: str, payload: Dict[str, Any], actor_id: str, action: str, details: Dict[str, Any]) -> Dict[str, Any]:
+    def mutate(self, record_id: int, expected_version: int, state: str, payload: Dict[str, Any], actor_id: str, action: str, details: Dict[str, Any], entitlement: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         now = _now()
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
@@ -108,6 +134,25 @@ class Repository:
                 "UPDATE records SET state=?,version=?,payload=?,updated_by=?,updated_at=? WHERE id=?",
                 (state, version, json.dumps(payload, ensure_ascii=False, sort_keys=True), actor_id, now, record_id),
             )
+            if entitlement is not None:
+                connection.execute(
+                    "INSERT INTO cash_entitlements(record_id,instrument,currency,quantity,per_share_amount,expected_amount,posted_amount,status,version,created_by,posted_by,created_at,posted_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (
+                        record_id,
+                        entitlement["instrument"],
+                        entitlement["currency"],
+                        int(entitlement["quantity"]),
+                        float(entitlement["per_share_amount"]),
+                        float(entitlement["expected_amount"]),
+                        None,
+                        "pending",
+                        1,
+                        actor_id,
+                        None,
+                        now,
+                        None,
+                    ),
+                )
             connection.execute(
                 "INSERT INTO audit_events(record_id,action,actor_id,version,details,created_at) VALUES(?,?,?,?,?,?)",
                 (record_id, action, actor_id, version, json.dumps(details, ensure_ascii=False, sort_keys=True), now),
@@ -115,6 +160,40 @@ class Repository:
             result = connection.execute("SELECT * FROM records WHERE id=?", (record_id,)).fetchone()
             connection.commit()
         return self._row(result)
+
+    def get_entitlement(self, record_id: int) -> Optional[Dict[str, Any]]:
+        self.get(record_id)
+        with self._connect() as connection:
+            row = connection.execute("SELECT * FROM cash_entitlements WHERE record_id=?", (record_id,)).fetchone()
+        return self._entitlement_row(row) if row is not None else None
+
+    def post_entitlement(self, record_id: int, expected_version: int, posted_amount: float, actor_id: str, details: Dict[str, Any]) -> Dict[str, Any]:
+        now = _now()
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute("SELECT * FROM cash_entitlements WHERE record_id=?", (record_id,)).fetchone()
+            if row is None:
+                connection.rollback()
+                raise NotFound("现金权益不存在")
+            if row["status"] != "pending":
+                connection.rollback()
+                raise Conflict("现金权益已入账")
+            if int(row["version"]) != int(expected_version):
+                connection.rollback()
+                raise Conflict("版本冲突，请刷新后重试")
+            version = int(expected_version) + 1
+            connection.execute(
+                "UPDATE cash_entitlements SET posted_amount=?,status=?,version=?,posted_by=?,posted_at=? WHERE id=?",
+                (float(posted_amount), "posted", version, actor_id, now, int(row["id"])),
+            )
+            record_version = connection.execute("SELECT version FROM records WHERE id=?", (record_id,)).fetchone()["version"]
+            connection.execute(
+                "INSERT INTO audit_events(record_id,action,actor_id,version,details,created_at) VALUES(?,?,?,?,?,?)",
+                (record_id, "post_cash", actor_id, int(record_version), json.dumps(details, ensure_ascii=False, sort_keys=True), now),
+            )
+            result = connection.execute("SELECT * FROM cash_entitlements WHERE record_id=?", (record_id,)).fetchone()
+            connection.commit()
+        return self._entitlement_row(result)
 
     def add_audit(self, record_id: int, actor_id: str, action: str, details: Dict[str, Any]) -> None:
         with self._connect() as connection:

@@ -6,7 +6,7 @@ from .domain import Actor, Conflict, ValidationError, boolean, choice, integer, 
 
 INITIAL_STATE = "captured"
 CREATE_ROLES = {'trader'}
-ACTION_ROLES = {'apply_corporate': {'corporate_actions'}, 'approve': {'settlement_officer'}, 'settle': {'settlement_officer'}, 'fail': {'settlement_officer'}, 'reverse': {'corporate_actions', 'settlement_officer'}}
+ACTION_ROLES = {'apply_corporate': {'corporate_actions'}, 'approve': {'settlement_officer'}, 'settle': {'settlement_officer'}, 'fail': {'settlement_officer'}, 'reverse': {'corporate_actions', 'settlement_officer'}, 'post_cash': {'settlement_officer'}}
 TRANSITIONS = {'apply_corporate': {'captured': 'adjusted'}, 'approve': {'captured': 'approved', 'adjusted': 'approved'}, 'settle': {'approved': 'settled'}, 'fail': {'approved': 'failed'}, 'reverse': {'settled': 'reversed', 'failed': 'reversed'}}
 
 
@@ -46,11 +46,13 @@ class DomainRules:
         p["net_amount"] = round(gross + fee if p["side"] == "buy" else gross - fee, 2)
         p["adjusted_quantity"] = p["quantity"]
         p["adjusted_price"] = p["price"]
-        if p["corporate_action"] == "split":
-            p["adjusted_quantity"] = int(float(p["quantity"]) * float(p["action_ratio"]))
+        # 拆股与合并均按换股比例调整持仓数量与均价（数量×比例，均价÷比例，保持成本不变）
+        if p["corporate_action"] in {"split", "merger"}:
+            adjusted_quantity = int(round(float(p["quantity"]) * float(p["action_ratio"])))
+            if adjusted_quantity <= 0:
+                raise ValidationError("换股比例过小，调整后持仓数量不能为0")
+            p["adjusted_quantity"] = adjusted_quantity
             p["adjusted_price"] = round(float(p["price"]) / float(p["action_ratio"]), 4)
-        elif p["corporate_action"] == "dividend":
-            p["cash_entitlement"] = round(float(p["quantity"]) * float(p["action_ratio"]), 2)
         return p
 
     def check_create_conflicts(self, payload: Dict[str, Any], existing: Iterable[Dict[str, Any]]) -> None:
@@ -65,19 +67,60 @@ class DomainRules:
             raise Conflict("当前状态不允许执行%s" % action)
         return allowed
 
-    def apply_action(self, record: Dict[str, Any], action: str, data: Dict[str, Any]) -> Tuple[str, Dict[str, Any], str]:
+    def apply_action(self, record: Dict[str, Any], action: str, data: Dict[str, Any]) -> Tuple[str, Dict[str, Any], str, Dict[str, Any]]:
         new_state = self.require_transition(record, action)
         data = dict(data or {})
         p = dict(record["payload"])
         changes: Dict[str, Any] = {}
         summary = ""
+        extras: Dict[str, Any] = {}
         if action == "apply_corporate":
             if p["corporate_action"] == "none":
                 raise ValidationError("没有待处理的公司行动")
+            corporate = p["corporate_action"]
+            quantity = int(p["quantity"])
+            price = float(p["price"])
+            ratio = float(p["action_ratio"])
+            if corporate in {"split", "merger"}:
+                # 应用时按换股比例即时调整：数量×比例，均价÷比例（保持成本不变）
+                effective_quantity = int(round(quantity * ratio))
+                if effective_quantity <= 0:
+                    raise ValidationError("换股比例过小，调整后持仓数量不能为0")
+                effective_price = round(price / ratio, 4)
+                changes["adjusted_quantity"] = effective_quantity
+                changes["adjusted_price"] = effective_price
+                changes["effective_quantity"] = effective_quantity
+                changes["effective_price"] = effective_price
+            else:
+                # 现金分红不改变持仓数量与均价
+                effective_quantity = quantity
+                effective_price = price
+                changes["effective_quantity"] = effective_quantity
+                changes["effective_price"] = effective_price
             changes["corporate_applied"] = True
-            changes["effective_quantity"] = p["adjusted_quantity"]
-            changes["effective_price"] = p["adjusted_price"]
-            summary = "公司行动已应用"
+            # 应用前后数量、价格、金额的审计对照
+            before_amount = round(quantity * price, 2)
+            after_amount = round(effective_quantity * effective_price, 2)
+            extras["comparison"] = {
+                "corporate_action": corporate,
+                "action_ratio": ratio,
+                "before": {"quantity": quantity, "price": round(price, 4), "amount": before_amount},
+                "after": {"quantity": effective_quantity, "price": round(effective_price, 4), "amount": after_amount},
+            }
+            if corporate == "dividend":
+                # 按股数生成一笔待入账的现金权益，入账后金额才可核对
+                entitlement_amount = round(quantity * ratio, 2)
+                extras["cash_entitlement"] = {
+                    "instrument": p["instrument"],
+                    "currency": p["currency"],
+                    "quantity": quantity,
+                    "per_share_amount": round(ratio, 4),
+                    "expected_amount": entitlement_amount,
+                    "status": "pending",
+                }
+                extras["comparison"]["before"]["cash_entitlement_amount"] = 0.0
+                extras["comparison"]["after"]["cash_entitlement_amount"] = entitlement_amount
+            summary = {"split": "拆股已应用", "merger": "合并换股已应用", "dividend": "现金分红已应用"}.get(corporate, "公司行动已应用")
         elif action == "approve":
             changes["approved_amount"] = p["net_amount"]
             summary = "结算指令复核通过"
@@ -99,4 +142,4 @@ class DomainRules:
             changes["reverse_reason"] = text(data, "reverse_reason")
             summary = "交收冲正"
         p.update(changes)
-        return new_state, p, summary or ("已执行%s" % action)
+        return new_state, p, summary or ("已执行%s" % action), extras
